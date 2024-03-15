@@ -1,0 +1,10 @@
+name: myenv
+channels:
+  - defaults
+dependencies:
+  - numpy=1.21.2
+  - torch=1.9.1
+  - scikit-learn=0.24.2
+  - pip
+  - pip:
+    - some-pip-package==1.0.0
