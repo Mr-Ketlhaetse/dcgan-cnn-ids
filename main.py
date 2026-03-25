@@ -1,232 +1,255 @@
-import pandas as pd
-import numpy as np
 import os
-from ctgan import CTGAN
-from preprocessing import detect_features, remove_null_rows, combine_datasets
-from IGTD_Functions import min_max_transform, table_to_image, select_features_by_variation
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pandas as pd
 import torch
-from cnn import CNNTransferLearning
-from dcgan import DCGAN
-from dcgan_2 import DCGAN as DCGAN_2
-from torchvision import transforms
-from custom_helpers import ImageDatasetLoader
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.dataset import Subset
-from sklearn.model_selection import GridSearchCV, train_test_split
+import yaml
 from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score, accuracy_score
-from sklearn.metrics import confusion_matrix
-import matplotlib.pyplot as plt
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.model_selection import learning_curve
+from sklearn.model_selection import GridSearchCV
+from torchvision import transforms
 
-def false_alarm_rate(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    if cm.size == 1:
-        tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
-    else:
-        tn, fp, fn, tp = cm.ravel()
-    far = fp / (fp + tn) if fp + tn > 0 else 0
-    return far
-
-def false_negative_rate(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    if cm.size == 1:
-        tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
-    else:
-        tn, fp, fn, tp = cm.ravel()
-    fnr = fn / (fn + tp) if fn + tp > 0 else 0
-    return fnr
-
-def true_negative_rate(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    if cm.size == 1:
-        tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
-    else:
-        tn, fp, fn, tp = cm.ravel()
-    tnr = tn / (tn + fp) if tn + fp > 0 else 0
-    return tnr
+from src.data.augmentation import run_augmentation
+from src.evaluation.drift import DriftDetector, DriftLevel
+from src.data.loader import ImageDatasetLoader
+from src.evaluation.metrics import false_alarm_rate, false_negative_rate, true_negative_rate
+from src.evaluation.visualisation import plot_and_log
+from src.features.igtd import min_max_transform, select_features_by_variation, table_to_image
+from src.models.classifier import CNNTransferLearning
+from src.models.dcgan import DCGAN
 
 
-def main():
-    # CTGAN hyperparameters
-    CTGAN_EPOCHS = 1
-    CTGAN_SAMPLES = 1000
-    ORIGINAL_SAMPLES = 5000
-    SYN_RATIO = 0.9
-    SAMPLED_DATA_FILE = f"{SYN_RATIO}_sampled.csv"
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
-    # GridSearchCv hyperparameters
-    CV = 3
+def _namespace(d):
+    """Recursively convert a dict to a SimpleNamespace for attribute access."""
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: _namespace(v) for k, v in d.items()})
+    return d
 
-    # Load original data
-    URL_ONLINE = 'https://www.kaggle.com/datasets/ekkykharismadhany/csecicids2018-cleaned/download?datasetVersionNumber=1'
-    LOCAL_FOLDER = './data/clean/cleaned_ids2018_sampled.csv'
-    original_data = pd.read_csv(LOCAL_FOLDER).iloc[:ORIGINAL_SAMPLES]
-    
-    # Remove rows with null values
-    original_data = remove_null_rows(original_data)
 
-    
-    # Detect continuous and discrete features
-    continuous_features, discrete_features = detect_features(original_data)
+def load_config(path='config/default.yaml'):
+    with open(path) as f:
+        return _namespace(yaml.safe_load(f))
 
-    # Train CTGAN model
-    ctgan = CTGAN(epochs=CTGAN_EPOCHS)
-    ctgan.fit(original_data, discrete_features)
 
-    # Generate synthetic data
-    synthetic_data = ctgan.sample(CTGAN_SAMPLES)
-    # print(synthetic_data.head(10))   
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
 
-    # Combine real and synthetic data
-    sample_data, sampled_filepath = combine_datasets(original_data, synthetic_data, SYN_RATIO, SAMPLED_DATA_FILE)
+def run_augmentation_stage(cfg, output_path):
+    print("Stage 1: Running CTGAN augmentation...")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_augmentation(
+        source_path=cfg.data.source,
+        original_samples=cfg.data.original_samples,
+        ctgan_epochs=cfg.augmentation.ctgan_epochs,
+        ctgan_samples=cfg.augmentation.ctgan_samples,
+        syn_ratio=cfg.augmentation.syn_ratio,
+        output_path=str(output_path),
+    )
+    print(f"  Saved augmented data to {output_path}")
 
-    # Select features based on variation
-    num_row = 26
-    num_col = 3
-    num = num_row * num_col
 
-    data = pd.read_csv(sampled_filepath)
-    id = select_features_by_variation(data, variation_measure='var', num=num)
-    data = data.iloc[:, id]
+def run_igtd_stage(cfg, augmented_path, image_dir):
+    print("Stage 2: Running IGTD table-to-image conversion...")
+    image_dir.mkdir(parents=True, exist_ok=True)
+
+    num = cfg.features.num_row * cfg.features.num_col
+    data = pd.read_csv(augmented_path)
+    feature_ids = select_features_by_variation(data, variation_measure=cfg.features.variation_measure, num=num)
+    data = data.iloc[:, feature_ids]
     norm_data = min_max_transform(data.values)
     norm_data = pd.DataFrame(norm_data, columns=data.columns, index=data.index)
 
-    # Separate real data and target column
-    real_target = norm_data['Label']
-    real_data = norm_data.drop(columns=['Label'])
+    result_dir = str(image_dir.parent)
+    table_to_image(
+        norm_data,
+        [cfg.features.num_row, cfg.features.num_col],
+        cfg.features.fea_dist_method,
+        cfg.features.image_dist_method,
+        cfg.features.save_image_size,
+        cfg.features.max_step,
+        cfg.features.val_step,
+        result_dir,
+        cfg.features.error,
+    )
+    print(f"  Images saved to {image_dir}")
 
-    # Convert table data to images
-    fea_dist_method = 'Euclidean'
-    image_dist_method = 'Euclidean'
-    error = 'abs'
-    result_dir = 'Results/Table_To_Image_Conversion/Test_1'
-    os.makedirs(name=result_dir, exist_ok=True)  # Create the result directory if it doesn't exist
 
-    save_image_size = 64  # Define the variable "save_image_size"
-    max_step = 30000  # Define the variable "max_step"
-    val_step = 300  # Define the variable "val_step"
+def _save_drift_reference(cfg, augmented_path):
+    num = cfg.features.num_row * cfg.features.num_col
+    data = pd.read_csv(augmented_path)
+    feature_ids = select_features_by_variation(
+        data, variation_measure=cfg.features.variation_measure, num=num
+    )
+    data = data.iloc[:, feature_ids]
+    DriftDetector.save_reference(data, cfg.drift.reference_path)
+    print(f"  Drift reference saved to {cfg.drift.reference_path}")
 
-    generated_images = table_to_image(real_data, [num_row, num_col], fea_dist_method, image_dist_method,
-                                      save_image_size,
-                                      max_step, val_step, result_dir, error)
 
-    # Load image dataset
-    folder_path = 'Results/Table_To_Image_Conversion/Test_1/data'
+def run_dcgan_stage(cfg, image_dir, weights_path):
+    print("Stage 3: Training DCGAN...")
     transform = transforms.Compose([
-        transforms.Resize((64)),
+        transforms.Resize(cfg.dcgan.img_size),
         transforms.ToTensor(),
     ])
-    image_dataset = ImageDatasetLoader(folder_path, image_type='png', transform=transform)
+    dataset = ImageDatasetLoader(str(image_dir), image_type='png', transform=transform)
+    dcgan = DCGAN(
+        dataset,
+        nz=cfg.dcgan.latent_dim,
+        ngf=cfg.dcgan.ngf,
+        ndf=cfg.dcgan.ndf,
+        nc=cfg.dcgan.img_channels,
+        weights_save_path=str(weights_path),
+        plots_save_dir=cfg.outputs.plots,
+    )
+    dcgan.train(num_epochs=cfg.dcgan.num_epochs)
+    print(f"  Discriminator weights saved to {weights_path}")
 
-    # Initialize DCGAN model
-    latent_dim = 100
-    img_channels = 3
-    img_size = 64
-    dcgan_model = DCGAN(image_dataset, latent_dim, img_channels, img_size)
 
-    # Train DCGAN model
-    dcgan_model.train()
+def run_classification_stage(cfg, image_dir, weights_path, augmented_path):
+    print("Stage 4: Training CNN classifier...")
+    transform = transforms.Compose([
+        transforms.Resize(cfg.dcgan.img_size),
+        transforms.ToTensor(),
+    ])
+    image_dataset = ImageDatasetLoader(str(image_dir), image_type='png', transform=transform)
 
-    # Load pretrained DCGAN discriminator
-    pretrained_dcgan_discriminator = DCGAN.Discriminator(img_channels, 64)
-    pretrained_dcgan_discriminator.load_state_dict(torch.load('dcgan_discriminator_weights.pth'))
-    pretrained_dcgan_discriminator.eval()
+    # Rebuild label vector aligned with sorted image filenames
+    num = cfg.features.num_row * cfg.features.num_col
+    data = pd.read_csv(augmented_path)
+    feature_ids = select_features_by_variation(data, variation_measure=cfg.features.variation_measure, num=num)
+    data = data.iloc[:, feature_ids]
+    norm_data = min_max_transform(data.values)
+    norm_data = pd.DataFrame(norm_data, columns=data.columns, index=data.index)
+    labels = torch.tensor(norm_data['Label'].values).long()
 
-    # Initialize CNN model for transfer learning
-    num_classes = len(real_target.unique())
-    cnn_model = CNNTransferLearning(pretrained_dcgan_discriminator, num_classes, learning_rate=0.01)
-    
-    # Define hyperparameters for grid search
-    param_grid = {
-        'learning_rate': [0.001, 0.01, 0.1]
-    }
+    # Load pretrained discriminator
+    discriminator = DCGAN.Discriminator(cfg.dcgan.img_channels, cfg.dcgan.ndf)
+    discriminator.load_state_dict(torch.load(str(weights_path), map_location='cpu'))
+    discriminator.eval()
 
-    # Define the scoring metrics for the model
-    far_scorer = make_scorer(false_alarm_rate) # custom function to calculate the false alarm rate
-    fnr_scorer = make_scorer(false_negative_rate) # custom function to calculate the false negative rate (miss rate
-    tnr_scorer = make_scorer(true_negative_rate) # custom function to calculate the true negative rate
-    
+    num_classes = int(labels.max().item()) + 1
+    cnn_model = CNNTransferLearning(
+        discriminator,
+        num_classes=num_classes,
+        img_channels=cfg.dcgan.img_channels,
+        img_size=cfg.dcgan.img_size,
+        learning_rate=cfg.classifier.learning_rates[0],
+    )
+    if cfg.classifier.unfreeze_blocks > 0:
+        cnn_model.set_trainable_layers(cfg.classifier.unfreeze_blocks)
+        print(f"  Unfreezing {cfg.classifier.unfreeze_blocks} discriminator block(s)")
+
     scoring = {
-    'precision': make_scorer(precision_score, average='macro', zero_division=1),
-    'recall': make_scorer(recall_score, average='macro'),
-    'f1_score': make_scorer(f1_score, average='macro'),
-    'accuracy': make_scorer(accuracy_score),
-    'false_alarm_rate': far_scorer,
-    'false_negative_rate': fnr_scorer,
-    'true_negative_rate': tnr_scorer	
+        'precision':          make_scorer(precision_score, average='macro', zero_division=1),
+        'recall':             make_scorer(recall_score, average='macro'),
+        'f1_score':           make_scorer(f1_score, average='macro'),
+        'accuracy':           make_scorer(accuracy_score),
+        'false_alarm_rate':   make_scorer(false_alarm_rate),
+        'false_negative_rate': make_scorer(false_negative_rate),
+        'true_negative_rate': make_scorer(true_negative_rate),
     }
+    param_grid = {'learning_rate': cfg.classifier.learning_rates}
+    grid_search = GridSearchCV(
+        cnn_model, param_grid,
+        cv=cfg.classifier.cv_folds,
+        scoring=scoring,
+        refit='f1_score',
+        error_score='raise',
+    )
+    grid_search.fit(image_dataset, labels)
 
-    # Create GridSearchCV object
-    grid_search = GridSearchCV(cnn_model, param_grid, cv=CV, scoring=scoring, refit='f1_score', error_score='raise')
+    print(f"  Best params: {grid_search.best_params_}")
+    print(f"  Best F1:     {grid_search.best_score_:.4f}")
 
-    # Fit GridSearchCV object to the data
-    grid_search.fit(image_dataset, torch.tensor(real_target).long())
-
-    # Print best parameters and best score
-    print("Best Parameters:", grid_search.best_params_) 
-    print("Best Score:", grid_search.best_score_)
-
-    # Create a SummaryWriter object
-    writer = SummaryWriter()
-
-    # Preview scorer names
-    print(grid_search.cv_results_.keys())
-
-
-    # Print scores for all metrics
-    for scorer_name in scoring.keys():
-        print(f"{scorer_name.capitalize()} Score: {grid_search.cv_results_['mean_test_' + scorer_name]}")
-        plt.plot(grid_search.cv_results_['mean_test_' + scorer_name])
-        plt.xlabel('Parameter Combination')
-        plt.ylabel(f"{scorer_name.capitalize()} Score")
-        plt.title(f"{scorer_name.capitalize()} Score vs Parameter Combination")
-        # Set y-axis limits here
-        plt.ylim([0, 1])  # Adjust as needed
-        plt.savefig(f"plots/{scorer_name}.png")
-        plt.clf()
-
-        # Generate learning curve
-        train_sizes, train_scores, test_scores = learning_curve(
-            grid_search.best_estimator_, image_dataset, torch.tensor(real_target).long(), cv=CV, scoring=scorer_name, n_jobs=1)
-
-        train_scores_mean = np.mean(train_scores, axis=1)
-        train_scores_std = np.std(train_scores, axis=1)
-        test_scores_mean = np.mean(test_scores, axis=1)
-        test_scores_std = np.std(test_scores, axis=1)
-
-        plt.figure()
-        plt.title(f"Learning Curve ({scorer_name.capitalize()} Score)")
-        plt.xlabel("Training examples")
-        plt.ylabel("Score")
-        plt.grid()
-
-        plt.fill_between(train_sizes, train_scores_mean - train_scores_std,
-                            train_scores_mean + train_scores_std, alpha=0.1, color="r")
-        plt.fill_between(train_sizes, test_scores_mean - test_scores_std,
-                            test_scores_mean + test_scores_std, alpha=0.1, color="g")
-        plt.plot(train_sizes, train_scores_mean, 'o-', color="r", label="Training score")
-        plt.plot(train_sizes, test_scores_mean, 'o-', color="g", label="Cross-validation score")
-
-        plt.legend(loc="best")
-
-        plt.savefig(f"plots/learning_curve_{scorer_name}.png")
-        plt.clf()
+    plot_and_log(
+        grid_search, scoring, image_dataset, labels,
+        cv=cfg.classifier.cv_folds,
+        plots_dir=cfg.outputs.plots,
+        tensorboard_dir=cfg.outputs.tensorboard,
+    )
+    _save_drift_reference(cfg, augmented_path)
 
 
-        #implement tensorboard
-        mean_score = np.mean(grid_search.cv_results_['mean_test_' + scorer_name])
-        # include other charts for the other metrics in the tensorboard
-        writer.add_scalar(f"{scorer_name.capitalize()} Score", mean_score)
-        writer.add_figure(f"{scorer_name.capitalize()} Score vs Parameter Combination", plt.figure())
-        writer.add_histogram(f"{scorer_name.capitalize()} Score", grid_search.cv_results_['mean_test_' + scorer_name])
-        # writer.add_hparams(param_grid, {scorer_name: mean_score})
-        # writer.add_graph(grid_search.best_estimator_, image_dataset)
+# ---------------------------------------------------------------------------
+# Drift check
+# ---------------------------------------------------------------------------
+
+def check_drift(cfg, new_data_path):
+    reference_path = cfg.drift.reference_path
+    if not Path(reference_path).exists():
+        print("No drift reference found. Run the full pipeline first to establish a baseline.")
+        return
+
+    data = pd.read_csv(new_data_path)
+    num = cfg.features.num_row * cfg.features.num_col
+    feature_ids = select_features_by_variation(
+        data, variation_measure=cfg.features.variation_measure, num=num
+    )
+    data = data.iloc[:, feature_ids]
+
+    psi_scores = DriftDetector.compute_psi(reference_path, data)
+    level, mean_psi = DriftDetector.assess(psi_scores)
+
+    print(f"\nDrift Report — {new_data_path}")
+    print(f"  Mean PSI:    {mean_psi:.4f}")
+    print(f"  Drift Level: {level.value.upper()}")
+
+    top5 = sorted(psi_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+    print("  Top drifted features:")
+    for feat, psi in top5:
+        print(f"    {feat}: {psi:.4f}")
+
+    recommendations = {
+        DriftLevel.NONE:        "No retraining needed.",
+        DriftLevel.MILD:        "Retrain head only: Stage 4 always runs, no config change needed.",
+        DriftLevel.SIGNIFICANT: "Set classifier.unfreeze_blocks=1 in config, delete weights file, re-run.",
+        DriftLevel.SEVERE:      "Full retrain: delete outputs/images/data/ and weights/, then re-run.",
+    }
+    print(f"\n  Recommendation: {recommendations[level]}")
 
 
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
-    writer.close()
-    
+def main(config_path='config/default.yaml'):
+    cfg = load_config(config_path)
+
+    augmented_path = Path(cfg.outputs.augmented) / f"{cfg.augmentation.syn_ratio}_sampled.csv"
+    image_dir = Path(cfg.outputs.images) / 'data'
+    weights_path = Path(cfg.dcgan.weights_path)
+
+    # Stage 1: CTGAN augmentation — skip if output CSV already exists
+    if not augmented_path.exists():
+        run_augmentation_stage(cfg, augmented_path)
+    else:
+        print(f"Stage 1: Skipped (found {augmented_path})")
+
+    # Stage 2: IGTD conversion — skip if images directory is already populated
+    if not image_dir.exists() or not any(image_dir.glob('*.png')):
+        run_igtd_stage(cfg, augmented_path, image_dir)
+    else:
+        print(f"Stage 2: Skipped (found images in {image_dir})")
+
+    # Stage 3: DCGAN training — skip if weights file already exists
+    if not weights_path.exists():
+        run_dcgan_stage(cfg, image_dir, weights_path)
+    else:
+        print(f"Stage 3: Skipped (found {weights_path})")
+
+    # Stage 4: CNN classification — always run (this is the fast iteration loop)
+    run_classification_stage(cfg, image_dir, weights_path, augmented_path)
+
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) > 2 and sys.argv[1] == '--check-drift':
+        check_drift(load_config(), sys.argv[2])
+    else:
+        config_path = sys.argv[1] if len(sys.argv) > 1 else 'config/default.yaml'
+        main(config_path)

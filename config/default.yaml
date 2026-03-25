@@ -1,0 +1,50 @@
+data:
+  source: ./data/clean/cleaned_ids2018_sampled.csv
+  original_samples: 5000
+
+augmentation:
+  ctgan_epochs: 100
+  ctgan_samples: 1000
+  syn_ratio: 0.9            # fraction of samples drawn from real pool
+
+features:
+  num_row: 26
+  num_col: 3
+  variation_measure: var
+  fea_dist_method: Euclidean
+  image_dist_method: Euclidean
+  error: abs
+  max_step: 30000
+  val_step: 300
+  save_image_size: 64
+
+dcgan:
+  latent_dim: 100
+  img_channels: 3
+  img_size: 64
+  num_epochs: 100
+  ndf: 64
+  ngf: 64
+  lr: 0.0002
+  momentum: 0.9
+  weights_path: ./weights/dcgan_discriminator_weights.pth
+
+classifier:
+  num_epochs: 10
+  batch_size: 32
+  cv_folds: 3
+  learning_rates: [0.001, 0.01, 0.1]
+  unfreeze_blocks: 0     # 0=frozen, 1=last conv block, 2=last 2 blocks, 3+=all
+
+drift:
+  reference_path: ./outputs/drift_reference.json
+  psi_mild: 0.1
+  psi_significant: 0.2
+  psi_severe: 0.5
+
+outputs:
+  augmented: ./outputs/augmented
+  images: ./outputs/images
+  dcgan_samples: ./outputs/dcgan_samples
+  plots: ./outputs/plots
+  tensorboard: ./outputs/tensorboard
