@@ -1,5 +1,7 @@
+import csv
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,15 +42,15 @@ def load_config(path='config/default.yaml'):
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
-def run_augmentation_stage(cfg, output_path):
-    print("Stage 1: Running CTGAN augmentation...")
+def run_augmentation_stage(cfg, output_path, syn_ratio):
+    print(f"Stage 1: Running CTGAN augmentation (syn_ratio={syn_ratio})...")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run_augmentation(
         source_path=cfg.data.source,
         original_samples=cfg.data.original_samples,
         ctgan_epochs=cfg.augmentation.ctgan_epochs,
         ctgan_samples=cfg.augmentation.ctgan_samples,
-        syn_ratio=cfg.augmentation.syn_ratio,
+        syn_ratio=syn_ratio,
         output_path=str(output_path),
     )
     print(f"  Saved augmented data to {output_path}")
@@ -91,8 +93,8 @@ def _save_drift_reference(cfg, augmented_path):
     print(f"  Drift reference saved to {cfg.drift.reference_path}")
 
 
-def run_dcgan_stage(cfg, image_dir, weights_path):
-    print("Stage 3: Training DCGAN...")
+def run_dcgan_stage(cfg, image_dir, weights_path, num_epochs, plots_save_dir):
+    print(f"Stage 3: Training DCGAN ({num_epochs} epochs)...")
     transform = transforms.Compose([
         transforms.Resize(cfg.dcgan.img_size),
         transforms.ToTensor(),
@@ -105,13 +107,36 @@ def run_dcgan_stage(cfg, image_dir, weights_path):
         ndf=cfg.dcgan.ndf,
         nc=cfg.dcgan.img_channels,
         weights_save_path=str(weights_path),
-        plots_save_dir=cfg.outputs.plots,
+        plots_save_dir=plots_save_dir,
     )
-    dcgan.train(num_epochs=cfg.dcgan.num_epochs)
+    dcgan.train(num_epochs=num_epochs)
     print(f"  Discriminator weights saved to {weights_path}")
 
 
-def run_classification_stage(cfg, image_dir, weights_path, augmented_path):
+def _append_training_log(cfg, grid_search, scoring, syn_ratio, dcgan_epochs):
+    log_path = cfg.outputs.training_log
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ['timestamp', 'syn_ratio', 'dcgan_epochs', 'best_lr'] + list(scoring.keys())
+    row = {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'syn_ratio': syn_ratio,
+        'dcgan_epochs': dcgan_epochs,
+        'best_lr': grid_search.best_params_.get('learning_rate', ''),
+    }
+    for scorer_name in scoring.keys():
+        scores = grid_search.cv_results_[f'mean_test_{scorer_name}']
+        row[scorer_name] = round(float(scores[grid_search.best_index_]), 4)
+    write_header = not Path(log_path).exists()
+    with open(log_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"  Training log updated: {log_path}")
+
+
+def run_classification_stage(cfg, image_dir, weights_path, augmented_path,
+                              plots_dir, tensorboard_dir, syn_ratio, dcgan_epochs):
     print("Stage 4: Training CNN classifier...")
     transform = transforms.Compose([
         transforms.Resize(cfg.dcgan.img_size),
@@ -170,10 +195,11 @@ def run_classification_stage(cfg, image_dir, weights_path, augmented_path):
     plot_and_log(
         grid_search, scoring, image_dataset, labels,
         cv=cfg.classifier.cv_folds,
-        plots_dir=cfg.outputs.plots,
-        tensorboard_dir=cfg.outputs.tensorboard,
+        plots_dir=plots_dir,
+        tensorboard_dir=tensorboard_dir,
     )
     _save_drift_reference(cfg, augmented_path)
+    _append_training_log(cfg, grid_search, scoring, syn_ratio, dcgan_epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -220,31 +246,44 @@ def check_drift(cfg, new_data_path):
 
 def main(config_path='config/default.yaml'):
     cfg = load_config(config_path)
+    weights_dir = Path(cfg.outputs.weights_dir)
+    n_combos = len(cfg.sweep.syn_ratios) * len(cfg.sweep.dcgan_epochs)
+    combo = 0
 
-    augmented_path = Path(cfg.outputs.augmented) / f"{cfg.augmentation.syn_ratio}_sampled.csv"
-    image_dir = Path(cfg.outputs.images) / 'data'
-    weights_path = Path(cfg.dcgan.weights_path)
+    for syn_ratio in cfg.sweep.syn_ratios:
+        augmented_path = Path(cfg.outputs.augmented) / f"{syn_ratio}_sampled.csv"
+        image_dir = Path(cfg.outputs.images) / str(syn_ratio) / 'data'
 
-    # Stage 1: CTGAN augmentation — skip if output CSV already exists
-    if not augmented_path.exists():
-        run_augmentation_stage(cfg, augmented_path)
-    else:
-        print(f"Stage 1: Skipped (found {augmented_path})")
+        # Stage 1: per syn_ratio — skip if CSV already exists
+        if not augmented_path.exists():
+            run_augmentation_stage(cfg, augmented_path, syn_ratio)
+        else:
+            print(f"Stage 1 [{syn_ratio}]: Skipped (found {augmented_path})")
 
-    # Stage 2: IGTD conversion — skip if images directory is already populated
-    if not image_dir.exists() or not any(image_dir.glob('*.png')):
-        run_igtd_stage(cfg, augmented_path, image_dir)
-    else:
-        print(f"Stage 2: Skipped (found images in {image_dir})")
+        # Stage 2: per syn_ratio — skip if images already exist
+        if not image_dir.exists() or not any(image_dir.glob('*.png')):
+            run_igtd_stage(cfg, augmented_path, image_dir)
+        else:
+            print(f"Stage 2 [{syn_ratio}]: Skipped (found images in {image_dir})")
 
-    # Stage 3: DCGAN training — skip if weights file already exists
-    if not weights_path.exists():
-        run_dcgan_stage(cfg, image_dir, weights_path)
-    else:
-        print(f"Stage 3: Skipped (found {weights_path})")
+        for dcgan_epochs in cfg.sweep.dcgan_epochs:
+            combo += 1
+            print(f"\n[{combo}/{n_combos}] syn_ratio={syn_ratio}, dcgan_epochs={dcgan_epochs}")
+            weights_path = weights_dir / f"dcgan_{syn_ratio}_{dcgan_epochs}.pth"
+            plots_dir = f"{cfg.outputs.plots}/{syn_ratio}/{dcgan_epochs}"
+            tensorboard_dir = f"{cfg.outputs.tensorboard}/{syn_ratio}/{dcgan_epochs}"
 
-    # Stage 4: CNN classification — always run (this is the fast iteration loop)
-    run_classification_stage(cfg, image_dir, weights_path, augmented_path)
+            # Stage 3: per (syn_ratio, dcgan_epochs) — skip if weights already exist
+            if not weights_path.exists():
+                run_dcgan_stage(cfg, image_dir, weights_path, dcgan_epochs, plots_dir)
+            else:
+                print(f"Stage 3: Skipped (found {weights_path})")
+
+            # Stage 4: always run
+            run_classification_stage(
+                cfg, image_dir, weights_path, augmented_path,
+                plots_dir, tensorboard_dir, syn_ratio, dcgan_epochs
+            )
 
 
 if __name__ == '__main__':

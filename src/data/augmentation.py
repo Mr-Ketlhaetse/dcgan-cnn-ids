@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 from ctgan import CTGAN
 from src.data.preprocessing import detect_features, remove_null_rows, combine_datasets
@@ -31,5 +33,9 @@ def run_augmentation(source_path, original_samples, ctgan_epochs, ctgan_samples,
     filename = output_path.split('/')[-1]
     folder = '/'.join(output_path.split('/')[:-1])
     combined, _ = combine_datasets(real_data, synthetic_data, syn_ratio, filename)
+
+    # combine_datasets saves to its own hardcoded folder; ensure file lands at output_path
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(output_path, index=False)
 
     return combined
